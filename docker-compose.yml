@@ -1,0 +1,35 @@
+# OptimusDB — dev Postgres for the AI Query Optimizer.
+# Boot:    docker compose up -d
+# Verify:  docker compose ps        (postgres should be "healthy")
+# Psql:    docker compose exec postgres psql -U optimus -d tpch
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: optimusdb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: optimus
+      POSTGRES_PASSWORD: optimus
+      POSTGRES_DB: tpch
+      # Silence collation warnings on first init.
+      LANG: C.UTF-8
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U optimus -d tpch"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata:
+    name: optimusdb-pgdata

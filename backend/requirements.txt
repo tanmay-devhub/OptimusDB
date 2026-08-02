@@ -1,0 +1,12 @@
+# Phase 1 — analyzer + benchmark.
+psycopg2-binary>=2.9,<3
+
+# Phase 3 — LLM integration. Groq, Mistral, and Cerebras all expose
+# OpenAI-compatible endpoints, so one SDK covers all three providers.
+openai>=1.30,<2
+python-dotenv>=1.0,<2
+
+# Phase 4 — HTTP API.
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+pydantic>=2.6,<3

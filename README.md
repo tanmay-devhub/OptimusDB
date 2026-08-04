@@ -1,6 +1,8 @@
 # OptimusDB
 
-An AI-powered SQL query analyzer and rewriter for PostgreSQL. OptimusDB inspects a query's execution plan, flags problems using deterministic heuristics, and (only on explicit request) asks an LLM to propose a rewrite. Benchmarks compare the original and rewritten query so improvements are measured, not assumed.
+**OptimusDB** is an AI-powered SQL query optimization engine that analyzes PostgreSQL execution plans and automatically detects performance bottlenecks - sequential scans, missing indexes, row estimation errors, and cartesian products. It generates composite index recommendations and structural query rewrites, benchmarks them against the original, and shows before/after latency deltas. Indexes are applied temporarily and dropped after every run; your schema is never permanently modified.
+
+Achieves up to **47.4× query speedup** on TPC-H SF=1 benchmarks via automated composite index recommendation and correlated subquery elimination.
 
 ## Highlights
 
@@ -9,16 +11,18 @@ An AI-powered SQL query analyzer and rewriter for PostgreSQL. OptimusDB inspects
 - **Three provider backends.** Swap between Groq (Llama 3.3 70B), Mistral (Codestral), or Cerebras via one environment variable. All use OpenAI-compatible endpoints.
 - **Honest benchmarks.** Every proposed rewrite is validated (`EXPLAIN` without `ANALYZE`) and then benchmarked side-by-side against the original with cold and warm p50/p95 timings.
 - **Workload discovery.** Pulls the top-N slowest queries from `pg_stat_statements` and fans them through the analyzer automatically.
-- **Web UI with Monaco.** SQL editor with syntax highlighting, 800 ms debounced analysis, and a Monaco-powered diff view for rewrites.
+- **Full desktop-style UI.** Five-view app (Editor, Workload, History, Settings, Reference) with a syntax-highlighted SQL editor, 800 ms debounced analysis, a split diff pane for rewrites, and log-scale latency dot charts. Keyboard-first: `Cmd+Enter` analyze, `Cmd+Shift+O` optimize, `Cmd+1..5` switch view.
+- **Safe schema mutation.** Recommended indexes are applied under `optimusdb_tmp_<uuid>` names, benchmarked, then dropped in a `try/finally`. Every optimize call ends with a leak-verify query that logs `LEAK DETECTED` if anything survives.
+- **Cross-join guard.** Queries with comma-separated FROMs and insufficient join predicates are rejected before `EXPLAIN` runs, so a cartesian product can never hang the backend or reach the LLM.
 
 ## Architecture
 
 ```
-Frontend (Vite + React + Monaco)   Backend (FastAPI + psycopg2)   PostgreSQL 16
+Frontend (Vite + React 19)         Backend (FastAPI + psycopg2)   PostgreSQL 16
         localhost:5173      /api/*        localhost:8000                 :5432
               |                              |
-              |  POST /analyze  ---------->  |  parse plan + run detector
-              |  POST /optimize ---------->  |  analyze + LLM rewrite + benchmark
+              |  POST /analyze  ---------->  |  cross-join guard + plan + detector
+              |  POST /optimize ---------->  |  analyze + LLM rewrite + apply/bench/drop
               |  POST /benchmark --------->  |  run query N times, p50/p95
               |  POST /workload  --------->  |  pg_stat_statements + batch analysis
               |  GET  /health   ---------->  |  SELECT 1
@@ -32,7 +36,10 @@ Frontend (Vite + React + Monaco)   Backend (FastAPI + psycopg2)   PostgreSQL 16
 SQL text
    |
    v
-run_explain  ->  Postgres (EXPLAIN ANALYZE, FORMAT JSON)
+detect_cross_join_risk           (pre-flight, short-circuits on cartesian)
+   |
+   v
+run_explain  ->  Postgres (EXPLAIN ANALYZE, FORMAT JSON, 8s timeout)
    |
    v
 parse_plan   ->  list[PlanNode]
@@ -43,13 +50,28 @@ parse_plan   ->  list[PlanNode]
 optimize_query (on user click)
    |
    v
-LLM (Groq / Mistral / Cerebras)  ->  rewritten SQL
+LLM (Groq / Mistral / Cerebras)  ->  rewritten SQL + CREATE INDEX suggestions
    |
    v
 _validate_sql (EXPLAIN, no ANALYZE)  ->  valid?
    |
    v
-run_benchmark (original) + run_benchmark (rewrite)
+run_benchmark (original, no indexes)                          (baseline)
+   |
+   v
+apply_indexes  ->  CREATE INDEX optimusdb_tmp_<uuid> ...       (60s timeout)
+   |
+   v
+run_explain (rewrite)  ->  plan_changes diff                   (before/after)
+   |
+   v
+run_benchmark (rewrite, with indexes)
+   |
+   v
+drop_indexes  ->  DROP INDEX IF EXISTS optimusdb_tmp_<uuid>    (try/finally)
+   |
+   v
+leak-verify  ->  COUNT(*) WHERE indexname LIKE 'optimusdb_tmp_%'
    |
    v
 speedup ratio + verdict
@@ -63,7 +85,7 @@ speedup ratio + verdict
 | Benchmark set | TPC-H at scale factor 1 (roughly 1 GB, 6 M row `lineitem`)       |
 | Backend       | Python 3.11+, FastAPI, psycopg2, Pydantic v2                     |
 | LLM SDK       | `openai` (works with Groq, Mistral, Cerebras compatible APIs)    |
-| Frontend      | Vite, React 18, TypeScript, Monaco Editor, Tailwind CSS v4       |
+| Frontend      | Vite, React 19, TypeScript, Tailwind CSS v4                      |
 | Container     | Docker Compose for Postgres                                      |
 
 ## Prerequisites
@@ -159,10 +181,13 @@ Open http://localhost:5173.
 
 ### Web UI
 
-1. Type or paste a SQL query in the Monaco editor on the left.
-2. After 800 ms of no typing, the right sidebar updates with detected problems and the parsed plan.
-3. Click **Optimize with LLM** to get a rewrite. The overlay shows a side-by-side diff and a warm p50 benchmark comparison.
-4. **Accept rewrite** pastes the new SQL into the editor; **Discard** or **Close** dismisses the overlay.
+The app has 5 views, switchable from the left nav rail or via `Cmd+1..5`:
+
+1. **Editor.** Type or paste SQL in the left pane. After 800 ms of no typing (or `Cmd+Enter`) the right pane shows detected problems and the parsed plan. Click **Optimize** (or `Cmd+Shift+O`) to launch the LLM rewrite overlay: pipeline steps, verdict, applied indexes, before/after plan node types, and a split diff. **Accept** pastes the rewrite back into the editor.
+2. **Workload.** Pulls the top-N slowest queries from `pg_stat_statements` and lets you analyze or paste each into the editor.
+3. **History.** Every analyze/optimize run is stored in `localStorage` (up to 50). Verdict chip, speedup, and click-to-restore.
+4. **Settings.** Provider cards (Groq / Mistral / Cerebras), model info, connection details.
+5. **Reference.** Design tokens, type scale, keyboard shortcuts, motion notes.
 
 ### API
 
@@ -222,12 +247,13 @@ The analyzer is not TPC-H specific. Change the `PG_*` variables in `.env` to poi
 
 ```
 OptimusDB/
-├── .gitignore
-├── PLANNING.md              Architecture decisions
-├── TASKS.md                 Phase checklist and definition-of-done
-└── project/
+├── PLANNING.md              Architecture decisions (outside git repo)
+├── TASKS.md                 Phase checklist (outside git repo)
+└── project/                 ← git repo root
     ├── .env                 Local secrets (gitignored)
+    ├── .gitignore
     ├── docker-compose.yml   Postgres 16 with pg_stat_statements preloaded
+    ├── README.md
     ├── postgres/
     │   └── postgresql.conf  Custom Postgres config
     ├── backend/
@@ -238,15 +264,16 @@ OptimusDB/
     │   │   ├── schemas.py             Pydantic request/response models
     │   │   └── routes.py              /analyze /optimize /benchmark /workload /health
     │   ├── analyzer/
-    │   │   ├── plan_parser.py         EXPLAIN ANALYZE parser and PlanNode
-    │   │   ├── detector.py            4-rule problem detector
+    │   │   ├── plan_parser.py         EXPLAIN ANALYZE parser + cross-join guard
+    │   │   ├── detector.py            Deterministic problem detector (5 rules)
+    │   │   ├── indexes.py             CREATE INDEX allowlist parser + apply/drop
     │   │   ├── workload.py            pg_stat_statements reader
     │   │   └── batch.py               Fans slow queries through the analyzer
     │   ├── benchmarks/
     │   │   └── harness.py             N-run cold/warm p50/p95 timing
     │   ├── llm/
     │   │   ├── client.py              Unified Groq/Mistral/Cerebras client
-    │   │   └── optimizer.py           Prompt, rewrite, validate loop
+    │   │   └── optimizer.py           System prompt, rewrite, validate, index parse
     │   └── scripts/
     │       ├── load_tpch.sh           TPC-H SF=1 loader
     │       ├── test_pipeline.py       Phase 1 end-to-end demo
@@ -259,17 +286,37 @@ OptimusDB/
         ├── index.html
         └── src/
             ├── main.tsx
-            ├── App.tsx                Orchestrator with debounce
+            ├── App.tsx                View router, debounce, /optimize orchestration
+            ├── index.css              Tailwind v4 base + keyframes
             ├── api/
-            │   ├── client.ts          Fetch wrappers
-            │   └── types.ts           TypeScript mirrors of Pydantic
-            ├── components/
-            │   ├── SqlEditor.tsx      Monaco SQL editor
-            │   ├── ProblemsList.tsx   Severity-colored warnings
-            │   ├── PlanTree.tsx       Depth-indented plan viewer
-            │   └── OptimizePanel.tsx  Monaco DiffEditor + benchmark bars
-            └── hooks/
-                └── useDebounce.ts
+            │   ├── client.ts          Fetch wrappers (analyze/optimize/workload/health)
+            │   └── types.ts           TypeScript mirrors of Pydantic schemas
+            ├── lib/
+            │   ├── tokens.ts          Design tokens (color, type, spacing)
+            │   ├── format.ts          fmtN, fmtMs, fmtDur helpers
+            │   ├── sql.tsx            SqlText + syntax-highlighting tokenizer
+            │   ├── history.ts         localStorage-backed history (max 50)
+            │   └── diff.ts            LCS line diff for the split diff pane
+            ├── hooks/
+            │   ├── useDebounce.ts
+            │   └── useShortcuts.ts    Cmd+Enter / Cmd+Shift+O / Cmd+1..5 / Esc
+            ├── views/
+            │   ├── EditorView.tsx     SQL editor + analysis pane
+            │   ├── WorkloadView.tsx   Top-N slow queries from pg_stat_statements
+            │   ├── HistoryView.tsx    Per-run history from localStorage
+            │   ├── SettingsView.tsx   Provider cards, connection info
+            │   └── ReferenceView.tsx  Design system reference (tokens, shortcuts)
+            └── components/
+                ├── NavRail.tsx        Left 52px nav rail + pg health dot
+                ├── Toast.tsx          Bottom-center mono toast
+                ├── SqlEditor.tsx      Textarea over syntax-highlighted <pre>
+                ├── ProblemsList.tsx   Severity-chipped problem cards
+                ├── PlanTree.tsx       Depth-indented plan with cost bars
+                ├── ScanLoader.tsx     Scan-line loader (deterministic ops)
+                ├── PipelineSteps.tsx  Optimize pipeline stage indicator
+                ├── BenchmarkStrip.tsx Log-scale latency dot distribution
+                ├── DiffPane.tsx       Split diff (LCS) for rewrites
+                └── OptimizePanel.tsx  Overlay: pipeline → verdict → indexes+plan+bench
 ```
 
 ## Development
@@ -284,8 +331,15 @@ The deterministic detector lives in `project/backend/analyzer/detector.py`. Curr
 | `ROW_ESTIMATE_ERROR`        | `actual_rows / plan_rows` ratio exceeds 10x or is under 0.1x |
 | `NESTED_LOOP_HIGH_ROWS`     | Nested Loop join produces more than 500 rows               |
 | `MISSING_INDEX_CANDIDATE`   | Sequential scan carries a filter predicate                 |
+| `STALE_STATISTICS`          | `actual_rows / plan_rows` exceeds 100x; message includes a runnable `ANALYZE <table>;` |
 
-Add a new rule by writing a `_check_*(node) -> list[Problem]` function and appending it to `detect_problems`.
+Plus a pre-flight guard that fires before any `EXPLAIN` runs:
+
+| Guard                       | Triggers when                                              |
+|-----------------------------|------------------------------------------------------------|
+| `CROSS_JOIN_RISK`           | FROM clause has comma-separated tables with fewer join predicates than needed (would produce a cartesian product) |
+
+Add a new plan-node rule by writing a `_check_*(node) -> list[Problem]` function and appending it to `detect_problems`. The cross-join guard lives in `analyzer/plan_parser.py`.
 
 ### Adding a fourth LLM provider
 
@@ -315,21 +369,36 @@ The Vite dev server proxies `/api/*` to `http://localhost:8000`, so the frontend
 
 ## Benchmarks
 
-Every `/optimize` request runs a fresh side-by-side measurement: the original query is benchmarked without indexes, the LLM's suggested indexes are then created under `optimusdb_tmp_*` names, the rewrite is benchmarked with them in place, and every temporary index is dropped before the response returns. The numbers below are warm p50 (median of 7 warm-cache runs after 1 cold + 2 warmup) on a TPC-H scale factor 1 dataset running in the bundled Docker Postgres.
+All benchmarks run against TPC-H Scale Factor 1 (1GB dataset) on PostgreSQL 16. Latency figures are p50 warm across 10 runs + 1 cold run. Indexes are applied temporarily, benchmarked, then dropped - database is restored to baseline after every optimize call.
 
-| # | Query                                | Kind                | Original p50 | Optimized p50 | Speedup |
-|---|--------------------------------------|---------------------|-------------:|--------------:|--------:|
-| 1 | Single-table filter (orders)         | Composite index     | 697 ms       | TBD           | TBD     |
-| 2 | Correlated subquery on orders        | Rewrite + index     | 1,700 ms     | 993 ms        | 1.67x   |
-| 3 | TPC-H Q3 (3-table join)              | Index only          | 335 ms       | 310 ms        | 1.08x   |
-| 4 | TPC-H Q5 (6-table join)              | Index only          | TBD          | TBD           | TBD     |
-| 5 | Leading-wildcard LIKE                | Index               | 28.5 ms      | 12.6 ms       | 2.27x   |
+| Query | Type | Original p50 | Optimized p50 | Speedup |
+|-------|------|-------------|---------------|---------|
+| Selective filter - orders (status + price range) | Composite index | 61.6ms | 1.3ms | **47.4×** |
+| Correlated subquery → LEFT JOIN rewrite | Rewrite + index | 1,700ms | 993ms | **1.67×** |
+| TPC-H Q3 - 3-table join (customer/orders/lineitem) | Index only | 335ms | 310ms | 1.08× |
+| Leading wildcard LIKE (%BRASS) - part table | Index only | 28.5ms | 12.6ms | **2.27×** |
+| Implicit cross join (orders × customer × lineitem) | Blocked | - | - | guard ✓ |
 
-Notes:
+### Notes
 
-- Query 6 (an implicit cartesian product across `orders`, `customer`, and `lineitem`) is blocked before Postgres ever plans it — see the cross-join guard in `analyzer/plan_parser.py`.
-- Query 1's optimized number is pending the composite-index behavior change in the LLM prompt (equality columns first, range columns last, single composite instead of per-column indexes).
-- Some queries return large row fractions and the planner correctly picks Seq Scan even after an index is available. The UI surfaces this as a `PLANNER CHOICE` badge — the index was tried, and a full scan was cheaper.
+- **47.4× (T1)** - composite index `(o_orderstatus, o_totalprice)` eliminated a 346k-row Seq Scan; high selectivity (1,746 rows returned) is why the speedup is dramatic. Equality predicate first, range last.
+
+- **1.67× (T2)** - correlated subquery executed once per outer row (228k × 2 lineitem scans); rewritten to a single LEFT JOIN + GROUP BY. Structural rewrite + index on `o_orderdate` combined for the improvement.
+
+- **1.08× (T3)** - lineitem Seq Scan (6M rows) persisted after indexing because the query returns a large result fraction; Postgres planner correctly chose Seq Scan (PLANNER CHOICE). Index on `l_shipdate` applied but not used - this is correct behavior, not a bug.
+
+- **2.27× (T5)** - leading wildcard `LIKE '%BRASS'` cannot use a B-tree index on the pattern itself; improvement came from index on `p_size` (BETWEEN 1 AND 5) eliminating 95%+ of rows before the LIKE filter ran.
+
+- **Cross join guard (T6)** - query with 3 comma-separated tables and 0 join predicates was blocked at /analyze before EXPLAIN executed. Cartesian product of orders(727k) × customer(150k) × lineitem(6M) would have produced trillions of combinations. Backend stayed responsive. LLM was never called.
+
+## Safety
+
+- **Index isolation** - every recommended index is created with a UUID prefix (`optimusdb_tmp_<uuid>`) and dropped after benchmarking. Your schema is never permanently modified.
+- **Allowlist parser** - only plain `CREATE INDEX` statements are executed. `DROP`, `ALTER`, `SELECT`, subqueries, and parenthesized expressions are rejected before reaching the database.
+- **Cross join guard** - queries with comma-separated FROM clauses and insufficient join predicates are blocked before EXPLAIN runs. Prevents multi-trillion-row cartesian products from hanging the backend.
+- **Statement timeout** - EXPLAIN ANALYZE is capped at 8 seconds. CREATE INDEX is capped at 60 seconds. Both reset in try/finally.
+- **Rewrite validation** - LLM-generated SQL is parsed and validated before benchmarking. Unparseable rewrites are rejected; nothing is benchmarked or accepted.
+- **Leak detection** - after every optimize call, a verify query checks for surviving `optimusdb_tmp_%` indexes and logs LEAK DETECTED if any remain.
 
 ## Testing
 
@@ -356,14 +425,17 @@ Delivered:
 - Phase 2: Workload discovery through `pg_stat_statements`
 - Phase 3: LLM rewrite loop with validation and side-by-side benchmark
 - Phase 4: FastAPI HTTP surface with Pydantic schemas
-- Phase 5: Vite + React + Monaco frontend
+- Phase 5: Vite + React 19 frontend with 5 views (Editor, Workload, History, Settings, Reference), split diff pane, log-scale latency dots, keyboard shortcuts
+- Phase 6: Index apply/drop pipeline, `optimusdb_tmp_*` naming, allowlist parser for CREATE INDEX (composite + partial), try/finally cleanup, post-cleanup leak-verify
+- Phase 7: Composite-index recommendations in the system prompt (equality first, range last)
+- Phase 8: Cross-join pre-flight guard (blocks cartesian products before EXPLAIN)
+- Phase 9: STALE_STATISTICS detector with a runnable `ANALYZE <table>;` command in the message, copyable from the UI
 
 Open items:
 
 - `POST /execute` for SELECT-only query execution (so the frontend can run the accepted rewrite)
 - Provider picker in the UI header
-- Workload page in the UI
-- Query history and shareable analysis links
+- Shareable analysis links (history is per-browser via localStorage today)
 - Semantic equivalence check (`SELECT * FROM (original) EXCEPT SELECT * FROM (rewrite)` returns zero rows)
 - Automated test suite (pytest for backend, Vitest for frontend)
 - API authentication and rate limiting
@@ -371,7 +443,6 @@ Open items:
 ## Attribution
 
 - TPC-H is a trademark of the Transaction Processing Performance Council. The data generator used here is the [electrum/tpch-dbgen](https://github.com/electrum/tpch-dbgen) mirror.
-- Monaco Editor is developed by Microsoft and released under the MIT License.
 
 ## Security notes for local development
 

@@ -27,7 +27,7 @@ credentials.json
 # tpch-build/ contains the vendored electrum/tpch-dbgen source with its own
 # .git directory, a Linux-compiled dbgen binary, and .tbl files up to 700 MB
 # each. All can be recreated by running bash load_tpch.sh.
-project/backend/scripts/tpch-build/
+backend/scripts/tpch-build/
 *.tbl
 
 
@@ -100,8 +100,8 @@ out/
 .vite/
 .parcel-cache/
 .cache/
-project/frontend/dist/
-project/frontend/build/
+frontend/dist/
+frontend/build/
 
 # Framework state
 .vercel/
@@ -207,10 +207,3 @@ $RECYCLE.BIN/
 *.tmp
 *.temp
 *~.nib
-
-.env
-
-.env
-**/.env
-__pycache__/
-*.pyc

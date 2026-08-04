@@ -15,11 +15,14 @@ leak — the naming prefix makes them easy to find and drop manually:
 """
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+
+logger = logging.getLogger(__name__)
 
 _TMP_PREFIX = "optimusdb_tmp_"
 
@@ -183,22 +186,41 @@ def drop_indexes(conn: Any, suggestions: list[IndexSuggestion]) -> list[str]:
 
     Returns the list of tmp_names we failed to drop, if any. Empty list
     means the database is back to the exact state it was in before.
+
+    Every drop attempt is logged. A silent leak (index survives but
+    nothing is reported) means we caught the exception here but the
+    caller ignored the return value — check the log for the exception
+    detail. See the post-cleanup leak-verify in the /optimize endpoint
+    which catches this class of bug immediately.
     """
     failed: list[str] = []
+    to_drop = [s for s in suggestions if s.applied]
+    if not to_drop:
+        return failed
+    logger.info(
+        "drop_indexes: attempting to drop %d index(es): %s",
+        len(to_drop),
+        [s.tmp_name for s in to_drop],
+    )
     prev_autocommit = getattr(conn, "autocommit", False)
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            for s in suggestions:
-                if not s.applied:
-                    continue
+            for s in to_drop:
                 # IF EXISTS so a partial-failure state doesn't cascade.
                 # Extra belt-and-braces: we generated the name, so this
                 # can only target something we created.
                 try:
                     cur.execute(f'DROP INDEX IF EXISTS "{s.tmp_name}"')
-                except Exception:
+                    logger.info("drop_indexes: dropped %s", s.tmp_name)
+                except Exception as exc:
                     failed.append(s.tmp_name)
+                    logger.exception(
+                        "drop_indexes: FAILED to drop %s (%s: %s)",
+                        s.tmp_name, type(exc).__name__, exc,
+                    )
     finally:
         conn.autocommit = prev_autocommit
+    if failed:
+        logger.error("drop_indexes: %d leak(s) not dropped: %s", len(failed), failed)
     return failed

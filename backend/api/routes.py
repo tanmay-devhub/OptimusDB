@@ -13,6 +13,8 @@ from the existing Phase 1-3 modules — this file only glues.
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from analyzer.batch import analyze_workload
@@ -42,6 +44,8 @@ from .schemas import (
     WorkloadResponse,
 )
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -280,6 +284,27 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
         finally:
             # 5. Drop everything we created, always.
             cleanup_leaks = drop_indexes(conn, rewrite.index_suggestions)
+
+        # 6. Post-cleanup verify. If any optimusdb_tmp_ index survives
+        #    here, either drop_indexes swallowed an exception or the
+        #    caller passed a suggestion list that didn't cover something
+        #    apply_indexes created. Log loudly so leaks surface in the
+        #    server log the moment they happen instead of accumulating.
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM pg_indexes "
+                    "WHERE indexname LIKE 'optimusdb_tmp_%'"
+                )
+                remaining = int(cur.fetchone()[0])
+            if remaining > 0:
+                logger.error(
+                    "LEAK DETECTED: %d optimusdb_tmp_ index(es) remain after cleanup "
+                    "(reported cleanup_leaks=%s)",
+                    remaining, cleanup_leaks,
+                )
+        except Exception:
+            logger.exception("Post-cleanup leak-verify query failed")
 
     applied_indexes = [
         IndexOut(

@@ -32,6 +32,42 @@ class PlanNode:
     depth: int
 
 
+def run_explain_planner_only(
+    query: str, conn: Any, statement_timeout_ms: int = 8000
+) -> dict:
+    """Run ``EXPLAIN (FORMAT JSON)`` - planner only, no execution.
+
+    Companion to ``run_explain`` for cases where we cannot afford to run
+    the query, most importantly the HypoPG hypothetical-index path:
+    hypothetical indexes only exist in the planner's mind, so any actual
+    execution (via ANALYZE) would fall back to the physical plan and
+    ignore them. The planner-only variant returns the plan the planner
+    *would* choose, which is exactly what we want to compare on cost.
+
+    Returned dict shape matches ``run_explain`` but ``Actual Rows``,
+    ``Actual Loops``, and ``Execution Time`` are all zero / absent -
+    downstream code that reads them via ``.get(..., 0)`` degrades
+    cleanly.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"SET statement_timeout = {int(statement_timeout_ms)}")
+        try:
+            cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+            row = cur.fetchone()
+        finally:
+            try:
+                cur.execute("RESET statement_timeout")
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    raw = row[0]
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    return raw[0]
+
+
 def run_explain(query: str, conn: Any, statement_timeout_ms: int = 8000) -> dict:
     """Run ``EXPLAIN (ANALYZE, FORMAT JSON)`` and return the top-level plan dict.
 

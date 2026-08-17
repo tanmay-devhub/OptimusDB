@@ -74,6 +74,10 @@ class IndexSuggestion:
     ddl: str               # the final CREATE INDEX we will execute
     applied: bool = False
     error: Optional[str] = None
+    # HypoPG bookkeeping. Populated by hypothesize_indexes(); left None by
+    # the physical apply_indexes() path. When set, indicates the planner
+    # was told a hypothetical index of this shape exists on this connection.
+    hypopg_oid: Optional[int] = None
 
 
 @dataclass
@@ -176,6 +180,86 @@ def apply_indexes(
                     s.error = f"{type(exc).__name__}: {exc}"
             # Reset so subsequent benchmark isn't clipped.
             cur.execute("RESET statement_timeout")
+    finally:
+        conn.autocommit = prev_autocommit
+
+
+def hypothesize_indexes(
+    conn: Any,
+    suggestions: list[IndexSuggestion],
+) -> None:
+    """Register each suggestion as a HypoPG hypothetical index.
+
+    HypoPG accepts the same ``CREATE INDEX ...`` string we would have
+    executed physically, and returns a fake oid the planner treats as a
+    real index for the remainder of the session. No files are written,
+    no locks are taken, and there is nothing to clean up on the disk -
+    the entire ``optimusdb_tmp_`` leak class disappears in this mode.
+
+    We idempotently ``CREATE EXTENSION IF NOT EXISTS hypopg`` before the
+    first call so an existing pgdata volume (where the init SQL never
+    ran) picks up the extension on first use.
+
+    Session-scoped: the hypothetical indexes are visible only on ``conn``.
+    Any other backend session sees the un-indexed schema. That is a
+    feature - concurrent analyses cannot pollute each other.
+
+    Failures are recorded on the individual IndexSuggestion (mirroring
+    ``apply_indexes``) so partial success is possible and the caller can
+    still EXPLAIN whatever indexes did register. Never raises.
+    """
+    if not suggestions:
+        return
+    prev_autocommit = getattr(conn, "autocommit", False)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS hypopg")
+            except Exception as exc:
+                # If the extension binary is missing (base image, not
+                # optimusdb-postgres:16-hypopg) every suggestion fails
+                # the same way. Record it once per suggestion so the
+                # caller can surface the setup issue clearly.
+                err = f"hypopg unavailable: {type(exc).__name__}: {exc}"
+                for s in suggestions:
+                    s.applied = False
+                    s.error = err
+                return
+            for s in suggestions:
+                try:
+                    cur.execute(
+                        "SELECT indexrelid FROM hypopg_create_index(%s)",
+                        (s.ddl,),
+                    )
+                    row = cur.fetchone()
+                    if row is None or row[0] is None:
+                        raise RuntimeError("hypopg_create_index returned no oid")
+                    s.hypopg_oid = int(row[0])
+                    s.applied = True
+                except Exception as exc:
+                    s.applied = False
+                    s.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        conn.autocommit = prev_autocommit
+
+
+def reset_hypothetical(conn: Any) -> None:
+    """Drop every hypothetical index registered on this connection.
+
+    ``hypopg_reset()`` is session-local and idempotent - safe to call
+    even if no hypothetical indexes exist. Logs and swallows any error
+    so cleanup never masks the caller's real failure. There is no
+    physical state to leak, so there is nothing to return.
+    """
+    prev_autocommit = getattr(conn, "autocommit", False)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT hypopg_reset()")
+            except Exception:
+                logger.exception("reset_hypothetical: hypopg_reset() failed")
     finally:
         conn.autocommit = prev_autocommit
 

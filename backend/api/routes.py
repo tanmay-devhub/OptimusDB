@@ -19,8 +19,19 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from analyzer.batch import analyze_workload
 from analyzer.detector import Problem, ProblemType, Severity, detect_problems
-from analyzer.indexes import apply_indexes, drop_indexes
-from analyzer.plan_parser import PlanNode, detect_cross_join_risk, parse_plan, run_explain
+from analyzer.indexes import (
+    apply_indexes,
+    drop_indexes,
+    hypothesize_indexes,
+    reset_hypothetical,
+)
+from analyzer.plan_parser import (
+    PlanNode,
+    detect_cross_join_risk,
+    parse_plan,
+    run_explain,
+    run_explain_planner_only,
+)
 from benchmarks.harness import BenchmarkResult, run_benchmark
 from llm.optimizer import optimize_query
 
@@ -196,14 +207,45 @@ def _plan_changes(before: list[PlanNode], after: list[PlanNode]) -> list[PlanCha
     return changes
 
 
+def _root_total_cost(nodes: list[PlanNode]) -> float | None:
+    """Total planner cost of the plan root, or None for an empty plan."""
+    return nodes[0].total_cost if nodes else None
+
+
+def _index_out(s) -> IndexOut:
+    """Copy an IndexSuggestion (physical or hypothetical) to its wire schema."""
+    return IndexOut(
+        tmp_name=s.tmp_name,
+        original_name=s.original_name,
+        table=s.table,
+        columns=s.columns,
+        ddl=s.ddl,
+        applied=s.applied,
+        error=s.error,
+        hypopg_oid=s.hypopg_oid,
+    )
+
+
 @router.post("/optimize", response_model=OptimizeResponse)
 def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
     """Analyze → LLM rewrite (+ index suggestions) → apply indexes →
     benchmark both → drop indexes → verdict.
 
-    The DB is mutated (CREATE INDEX) and then restored (DROP INDEX)
-    within this single request. If cleanup fails, the tmp names are
-    reported in ``cleanup_leaks`` and can be dropped manually.
+    Two modes selected by ``req.mode``:
+
+    * ``"measure"`` (default) — physical CREATE INDEX + wall-clock
+      benchmark of both queries + DROP INDEX. Accurate but slow, and
+      unsafe on huge tables. Retained for the current TPC-H story and
+      any staging-scale run.
+    * ``"hypothetical"`` — HypoPG hypothetical indexes + planner-cost
+      comparison. Zero disk writes, zero locks, safe on any DB size.
+      Verdict is a ``cost_ratio`` not a ``speedup``.
+
+    In measure mode the DB is mutated (CREATE INDEX) and then restored
+    (DROP INDEX) within this single request. If cleanup fails, the tmp
+    names are reported in ``cleanup_leaks``. Hypothetical mode cannot
+    leak anything - HypoPG state is session-local and reset before
+    returning.
     """
     # Pre-flight cross-join guard — same rationale as /analyze. Short-circuit
     # before any DB work or LLM call, since a cartesian-product query would
@@ -218,9 +260,13 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
             unchanged=False,
             validation_error=None,
             llm=None,
+            mode=req.mode,
             original_benchmark=None,
             rewrite_benchmark=None,
             speedup=None,
+            cost_ratio=None,
+            original_total_cost=None,
+            rewrite_total_cost=None,
             problems=[_cross_join_problem(reason)],
             applied_indexes=[],
             rejected_ddl=[],
@@ -236,6 +282,7 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
 
     nodes_before = parse_plan(raw)
     problems = detect_problems(nodes_before)
+    original_total_cost = _root_total_cost(nodes_before)
 
     try:
         rewrite = optimize_query(req.query, problems, nodes_before, conn)
@@ -245,9 +292,74 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
     orig_b: BenchmarkOut | None = None
     new_b: BenchmarkOut | None = None
     speedup: float | None = None
+    cost_ratio: float | None = None
+    rewrite_total_cost: float | None = None
     plan_changes: list[PlanChangeOut] = []
     cleanup_leaks: list[str] = []
 
+    # --- Hypothetical mode ----------------------------------------------
+    # Route the entire post-rewrite path through HypoPG. No physical DDL,
+    # no benchmark harness, no cleanup_leaks bookkeeping - the planner
+    # cost delta is the verdict.
+    if rewrite.valid and req.mode == "hypothetical":
+        # HypoPG hypothetical indexes only exist in the planner's mind -
+        # they cannot be physically read. So we MUST use planner-only
+        # EXPLAIN (no ANALYZE) here, or the planner falls back to
+        # Seq Scan and the hypothetical index is invisible in the plan.
+        # For symmetry we also re-cost the original plan without ANALYZE
+        # so the ratio compares like-for-like.
+        try:
+            raw_orig_planner = run_explain_planner_only(req.query, conn)
+            original_total_cost = _root_total_cost(parse_plan(raw_orig_planner))
+        except Exception:
+            pass
+        try:
+            hypothesize_indexes(conn, rewrite.index_suggestions)
+            try:
+                raw_after = run_explain_planner_only(rewrite.rewritten_sql, conn)
+                nodes_after = parse_plan(raw_after)
+                rewrite_total_cost = _root_total_cost(nodes_after)
+                plan_changes = _plan_changes(nodes_before, nodes_after)
+            except Exception:
+                # Rewrite validated moments ago; a fresh EXPLAIN failure
+                # here would be surprising but not fatal.
+                plan_changes = []
+            if (
+                original_total_cost is not None
+                and rewrite_total_cost is not None
+                and rewrite_total_cost > 0
+            ):
+                cost_ratio = original_total_cost / rewrite_total_cost
+        finally:
+            reset_hypothetical(conn)
+
+        return OptimizeResponse(
+            original_sql=rewrite.original_sql,
+            rewritten_sql=rewrite.rewritten_sql,
+            valid=rewrite.valid,
+            unchanged=rewrite.unchanged,
+            validation_error=rewrite.validation_error,
+            llm=LLMResponseOut(
+                model=rewrite.llm_response.model,
+                input_tokens=rewrite.llm_response.input_tokens,
+                output_tokens=rewrite.llm_response.output_tokens,
+                latency_ms=rewrite.llm_response.latency_ms,
+            ),
+            mode="hypothetical",
+            original_benchmark=None,
+            rewrite_benchmark=None,
+            speedup=None,
+            cost_ratio=cost_ratio,
+            original_total_cost=original_total_cost,
+            rewrite_total_cost=rewrite_total_cost,
+            problems=[_problem_out(p) for p in problems],
+            applied_indexes=[_index_out(s) for s in rewrite.index_suggestions],
+            rejected_ddl=rewrite.rejected_ddl,
+            plan_changes=plan_changes,
+            cleanup_leaks=[],
+        )
+
+    # --- Measure mode (default, unchanged behavior) ---------------------
     # Bench + index-apply only makes sense if the rewrite parses. If it
     # doesn't, we bail out with what we have — no DB mutation happens.
     if rewrite.valid:
@@ -271,6 +383,7 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
                 raw_after = run_explain(rewrite.rewritten_sql, conn)
                 nodes_after = parse_plan(raw_after)
                 plan_changes = _plan_changes(nodes_before, nodes_after)
+                rewrite_total_cost = _root_total_cost(nodes_after)
             except Exception:
                 # Rewrite validated moments ago; a fresh EXPLAIN failure
                 # here would be surprising but not fatal — skip the
@@ -306,19 +419,6 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
         except Exception:
             logger.exception("Post-cleanup leak-verify query failed")
 
-    applied_indexes = [
-        IndexOut(
-            tmp_name=s.tmp_name,
-            original_name=s.original_name,
-            table=s.table,
-            columns=s.columns,
-            ddl=s.ddl,
-            applied=s.applied,
-            error=s.error,
-        )
-        for s in rewrite.index_suggestions
-    ]
-
     return OptimizeResponse(
         original_sql=rewrite.original_sql,
         rewritten_sql=rewrite.rewritten_sql,
@@ -331,11 +431,15 @@ def optimize(req: QueryRequest, conn=Depends(get_conn)) -> OptimizeResponse:
             output_tokens=rewrite.llm_response.output_tokens,
             latency_ms=rewrite.llm_response.latency_ms,
         ),
+        mode="measure",
         original_benchmark=orig_b,
         rewrite_benchmark=new_b,
         speedup=speedup,
+        cost_ratio=None,
+        original_total_cost=original_total_cost,
+        rewrite_total_cost=rewrite_total_cost,
         problems=[_problem_out(p) for p in problems],
-        applied_indexes=applied_indexes,
+        applied_indexes=[_index_out(s) for s in rewrite.index_suggestions],
         rejected_ddl=rewrite.rejected_ddl,
         plan_changes=plan_changes,
         cleanup_leaks=cleanup_leaks,

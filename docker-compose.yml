@@ -5,7 +5,13 @@
 
 services:
   postgres:
-    image: postgres:16
+    # Built locally so we can bundle the HypoPG extension (see
+    # ./postgres/Dockerfile). Rebuild after pulling a new base: `docker
+    # compose build postgres`.
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: optimusdb-postgres:16-hypopg
     container_name: optimusdb-postgres
     restart: unless-stopped
     environment:
@@ -19,6 +25,10 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      # Runs only on a *fresh* pgdata volume. For existing volumes, the
+      # backend idempotently issues CREATE EXTENSION IF NOT EXISTS on
+      # first HypoPG use.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     command:
       - postgres
       - -c

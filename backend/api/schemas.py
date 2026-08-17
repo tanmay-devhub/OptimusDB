@@ -7,9 +7,16 @@ the change in the API — the wire format stays under our control.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+# Two operating modes for /optimize.
+#   "measure"      - apply/bench/drop real indexes, report wall-clock speedup
+#   "hypothetical" - register HypoPG indexes, report planner cost_ratio
+# Default stays "measure" for backward compatibility with existing callers.
+OptimizeMode = Literal["measure", "hypothetical"]
 
 
 # --- Requests ---------------------------------------------------------------
@@ -18,6 +25,19 @@ class QueryRequest(BaseModel):
     """Any endpoint that takes a single SQL query."""
 
     query: str = Field(..., min_length=1, description="Read-only SQL to analyze.")
+    # Only consulted by /optimize. /analyze ignores it. Default is
+    # "measure" so existing clients keep the current apply/bench/drop
+    # behavior. "hypothetical" is the production-safe path - HypoPG
+    # only, no benchmarks, no physical DDL.
+    mode: OptimizeMode = Field(
+        default="measure",
+        description=(
+            "Optimization mode. 'measure' applies real indexes and benchmarks "
+            "both queries (accurate, slow, unsafe on huge tables). "
+            "'hypothetical' uses HypoPG and compares planner costs "
+            "(fast, safe, planner-cost currency instead of wall-clock)."
+        ),
+    )
 
 
 class BenchmarkRequest(BaseModel):
@@ -83,6 +103,9 @@ class IndexOut(BaseModel):
     ddl: str
     applied: bool
     error: Optional[str] = None
+    # Set only when the index was registered as a HypoPG hypothetical
+    # (i.e. mode="hypothetical"). None for the physical-apply path.
+    hypopg_oid: Optional[int] = None
 
 
 class PlanChangeOut(BaseModel):
@@ -134,11 +157,30 @@ class OptimizeResponse(BaseModel):
     # Non-empty when the pre-flight guard short-circuited before any DB
     # work. UI surfaces this as a red banner over the diff pane.
     blocked_reason: Optional[str] = None
+    # Which pipeline ran. Echoed back so the frontend can label the
+    # verdict correctly ("Measured 47.4x faster" vs "Planner estimates
+    # 47.4x cheaper").
+    mode: OptimizeMode = "measure"
     original_benchmark: Optional[BenchmarkOut] = None
     rewrite_benchmark: Optional[BenchmarkOut] = None
     speedup: Optional[float] = Field(
         default=None,
-        description="warm_p50(original) / warm_p50(rewrite). >1 means rewrite is faster.",
+        description="warm_p50(original) / warm_p50(rewrite). >1 means rewrite is faster. Only set in mode='measure'.",
+    )
+    # Planner cost ratio: total_cost(original) / total_cost(rewrite).
+    # >1 means the planner thinks the rewrite is cheaper. Only set in
+    # mode='hypothetical'; speedup will be None in that mode.
+    cost_ratio: Optional[float] = Field(
+        default=None,
+        description="total_cost(original) / total_cost(rewrite_with_hypothetical_indexes). >1 means planner prefers the rewrite. Only set in mode='hypothetical'.",
+    )
+    original_total_cost: Optional[float] = Field(
+        default=None,
+        description="Planner total_cost for the original query. Set in both modes.",
+    )
+    rewrite_total_cost: Optional[float] = Field(
+        default=None,
+        description="Planner total_cost for the rewrite (with hypothetical indexes in hypothetical mode).",
     )
     problems: list[ProblemOut]
     # Indexes the LLM proposed. Each carries whether we successfully
